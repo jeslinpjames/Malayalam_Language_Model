@@ -78,15 +78,19 @@ class MultiHeadAttention(nn.Module):
     def __init__(self,num_heads,head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embed,n_embed)
     def forward(self,x):
-        return torch.cat([h(x) for h in self.heads],dim =-1)# concat along the channels dimension
+        out = torch.cat([h(x) for h in self.heads],dim =-1)# concat along the channels dimension
+        out = self.proj(out)
+        return out
 
 class FeedForward(nn.Module):
     def __init__(self,n_embed):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embed,n_embed),
+            nn.Linear(n_embed,4 * n_embed),
             nn.ReLU(),
+            nn.Linear(4 * n_embed,n_embed),#projection layer going back into residual pathway
         )
     def forward(self,x):
         out =self.net(x)
@@ -100,8 +104,8 @@ class Blocks(nn.Module):
         self.ffwd = FeedForward(n_embed)
     
     def forward(self,x):
-        x = self.sa(x)
-        x = self.ffwd(x)
+        x = x + self.sa(x)
+        x = x + self.ffwd(x)
         return x
     
 class BigramLanguageModel(nn.Module):
@@ -121,8 +125,6 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) #(Batch,Time ,Channels)
         pos_emb = self.position_embedding_table(torch.arange(T,device=device))
         x = pos_emb + tok_emb
-        x = self.sa_head(x)
-        x = self.ffwd(x)
         logits =self.lm_head(x)#(B,T,Vocab_size)
         if targets is None:
             loss = None

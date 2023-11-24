@@ -4,10 +4,13 @@ import torch.nn.functional as F
 
 block_size = 8 #number of characters per sequence
 batch_size = 32 #number of sequences per batch
-max_iterations = 5000
-learning_rate = 1e-3
+max_iterations = 8000
+learning_rate = 1e-4
 device = 'cuda'if torch.cuda.is_available()else 'cpu'
+print(device)
 n_embed = 32
+eval_interval = 300
+eval_iters = 300
 
 
 torch.manual_seed(1337)
@@ -38,13 +41,54 @@ def get_batch(split):
     x,y = x.to(device),y.to(device)
     return x,y
 
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train','val']:
+        losses =torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X,Y = get_batch(split)
+            logits,loss = model(X,Y)
+            losses[k]= loss.item()
+        out[split]=losses.mean()
+    model.train()
+    return out
+
+class Head(nn.Module):
+    def __init__(self,head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embed,head_size, bias = False)
+        self.query = nn.Linear(n_embed,head_size,bias = False)
+        self.value = nn.Linear(n_embed,head_size, bias=False)
+        self.register_buffer('tril',torch.tril(torch.ones(block_size,block_size)))#since tril isn't a parameter of nn.Module, so we register it as a buffer
+
+    def forward(self,x):
+        B,T,C = x.shape #Batch, Time, Channels
+        k = self.key(x)
+        q = self.query(x)
+        wei = q @ k.transpose(-2,-1) * C**(-0.5) #(B,T,C) @ (B,C,T) = (B,T,T)
+        wei = wei.masked_fill(self.tril[:T,:T]==0,float('-inf')) #B,T,T
+        wei = F.softmax(wei,dim =-1)#B,T,T
+        v = self.value(x) #(B,T,C)
+        out = wei @ v #(B,T,T) @ (B,T,C) = (B,T,C)
+        return out
+
 
 class BigramLanguageModel(nn.Module):
-    def __init__(self,vocab_size):
+    def __init__(self):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)#Embedding layer
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)#Embedding layer
+        self.position_embedding_table = nn.Embedding(block_size,n_embed)#position embedding layer
+        self.lm_head = nn.Linear(n_embed,vocab_size)#Linear layer
+        self.sa_head = Head(n_embed)
     def forward(self,idx,targets=None):
-        logits = self.token_embedding_table(idx)
+        B,T = idx.shape
+        tok_emb = self.token_embedding_table(idx) #(Batch,Time ,Channels)
+        pos_emb = self.position_embedding_table(torch.arange(T,device=device))
+        x = pos_emb + tok_emb
+        x = self.sa_head(x)
+        logits =self.lm_head(x)#(B,T,Vocab_size)
         if targets is None:
             loss = None
         else:
@@ -55,6 +99,7 @@ class BigramLanguageModel(nn.Module):
         return logits, loss
     def generate(self,idx,max_new_tokens):
         for i in range(max_new_tokens):
+            # idx_cont = idx[:,-block_size:]#crop idx to last block_size tokens
             logits,loss = self.forward(idx)
             logits = logits[:,-1,:] # to drop the last dimension T
             probs = F.softmax(logits, dim=-1)# converted to probabilities
@@ -62,16 +107,19 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx,idx_next), dim =1)# append next integer to current stream of intergers after sampling 1 element
         return idx
     
-model  = BigramLanguageModel(vocab_size)
+model  = BigramLanguageModel()
 m = model.to(device)
 
 Optimizer = torch.optim.AdamW(model.parameters(),lr=learning_rate)
 
 for iteration in range(max_iterations):
+    if iteration % eval_interval==0:
+        losses = estimate_loss()
+        print(f"step {iteration} : train loss {losses['train']:.4f},val loss {losses['val']:.4f}")
     xb,yb = get_batch('train')
     logits,loss = m(xb,yb)
     loss.backward()#backpropagation
     Optimizer.step()#gradient descent
 print('Loss:',loss.item())
-
-print(decode(m.generate(idx=torch.zeros((1,1),dtype = torch.long),max_new_tokens =300)[0].tolist()))
+content = torch.zeros((1,1),dtype=torch.long,device=device)
+print(decode(m.generate(idx=content,max_new_tokens =300)[0].tolist()))
